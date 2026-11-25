@@ -1483,7 +1483,8 @@ app.post('/api/instances/:id/auto-reply/send', async (req, reply) => {
   if (busy) return reply.code(409).send(busy);
   const body = ((req.body as any) ?? {}) as { text?: string; withEnter?: boolean };
   try {
-    return await sendDraft(inst, String(body.text || ''), body.withEnter === true);
+    // 人工点面板按钮时焦点在浏览器，必须先聚焦微信窗口+输入框，否则焦点校验直接拒绝、草稿填不进去。
+    return await sendDraft(inst, String(body.text || ''), body.withEnter === true, { autoFocus: true });
   } catch (e: any) {
     return reply.code(500).send({ error: e?.message || '发送失败' });
   }

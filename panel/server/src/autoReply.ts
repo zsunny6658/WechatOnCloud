@@ -45,7 +45,8 @@ export type PublicAutoReplyConfig = Omit<AutoReplyConfig, 'apiKey'> & {
 export interface DraftResult {
   shouldReply: boolean;
   reason: string;
-  contact: string;
+  contact: string; // 会话名（群名 / 联系人名）
+  speaker: string; // 发言人名字（群聊里与会话名不同）
   message: string;
   reply: string;
   usedScreenshot: boolean;
@@ -86,8 +87,19 @@ const DEFAULT_PROMPT =
   '你是微信桌面端的信息抽取与回复助手。截图是微信聊天窗口，只分析右侧聊天区域：气泡靠右是自己发的，靠左是对方发的。' +
   '只识别最底部一条「靠左」的新消息，忽略自己刚发的消息、系统提示、时间分割线、图片/文件/语音/表情本身。' +
   '以本人身份简短自然地回复，像真人聊天，不使用客套长句，不提 AI 身份。' +
-  '严格输出 JSON，不要 Markdown 代码块：{"shouldReply":true/false,"reason":"","contact":"","message":"","reply":""}' +
-  '。sys/文件/语音/表情/纯图片无法可靠理解时 shouldReply=false。';
+  '严格输出 JSON，不要 Markdown 代码块：{"shouldReply":true/false,"reason":"","contact":"","speaker":"","message":"","reply":""}' +
+  '。contact 填窗口顶部标题栏的会话名（群聊填群名、单聊填联系人名），speaker 填发言人名字。' +
+  'sys/文件/语音/表情/纯图片无法可靠理解时 shouldReply=false。';
+
+// 字段语义强约束：无论用户 prompt 怎么改（含 accounts.json 里已保存的旧 prompt），调用时都追加这段。
+// 历史 bug：prompt 没定义 contact，模型常把「发言人昵称」填进 contact，而白名单填的是群名/会话名，
+// 导致 applyRules 白名单永远匹配不上 → 切到会话却不回复；assist 模式同样因白名单被标「无需回复」。
+const FIELD_CONTRACT =
+  '【字段硬性约定，优先级高于其他说明】contact 必须是本窗口顶部标题栏显示的「会话名称」：' +
+  '群聊填群名（例如「XX工作群」），单聊填联系人昵称或备注名；禁止填发言人昵称或消息正文里的人名。' +
+  'speaker 单独填最后一条消息的发言人名字（无法确认就留空字符串）。' +
+  'message 填最后一条靠左新消息的正文。reply 填你要发出的回复。' +
+  'JSON 必须包含 shouldReply、reason、contact、speaker、message、reply 六个字段。';
 
 const DEFAULTS: AutoReplyConfig = {
   mode: 'off',
@@ -232,7 +244,9 @@ async function callModel(cfg: AutoReplyConfig, image: Buffer | null, userText: s
   if (!cfg.apiKey) throw new Error('尚未配置 API Key（在「桌面设置 → AI 代回」里填写）');
   const content: any[] = [{ type: 'text', text: cfg.prompt }];
   if (image) content.push({ type: 'image_url', image_url: { url: `data:image/png;base64,${image.toString('base64')}` } });
+  // 字段约定后置，且放在 userText 之后：既覆盖用户自定义/历史 prompt 的模糊定义，也利用末尾注意力。
   content.push({ type: 'text', text: userText });
+  content.push({ type: 'text', text: FIELD_CONTRACT });
   const url = `${cfg.baseURL.replace(/\/+$/, '')}/chat/completions`;
   const res = await fetch(url, {
     method: 'POST',
@@ -257,6 +271,7 @@ async function callModel(cfg: AutoReplyConfig, image: Buffer | null, userText: s
       ? `模型 ${cfg.model} 是识别类模型，无法生成回复，请换成视觉对话模型（如 Qwen3-VL-32B-Instruct / qwen3-vl-plus）`
       : '模型未返回可解析的 JSON',
     contact: '',
+    speaker: '',
     message: text.slice(0, 200),
     reply: '',
   };
@@ -437,14 +452,31 @@ export async function verifyAutoReplyModel(id: string, patch?: Record<string, un
 }
 
 // ---------- 规则过滤 ----------
+// 归一化：忽略空白、大小写、常见标点差异，避免「泛东亚地区无敌群」与「泛东亚 地区无敌群」匹配不上。
+function normalizeName(v: unknown): string {
+  return String(v || '')
+    .toLowerCase()
+    .replace(/[\s\u00a0·・\-_—()（）\[\]【】{}<>《》,，。.!！?？:：;；'"“”‘’]/g, '');
+}
+
+function whitelistHit(cfg: AutoReplyConfig, d: DraftResult): boolean {
+  if (!cfg.whitelist.length) return true;
+  // 命中来源：会话名（群名/联系人）、发言人、消息正文。任一命中即可。
+  const fields = [d.contact, d.speaker, d.message].map(normalizeName).filter(Boolean);
+  return cfg.whitelist.some((w) => {
+    const kw = normalizeName(w);
+    if (!kw) return false;
+    return fields.some((f) => f.includes(kw) || kw.includes(f));
+  });
+}
+
 function applyRules(cfg: AutoReplyConfig, d: DraftResult): DraftResult {
   if (!d.shouldReply) return d;
   const text = String(d.message || '');
   if (!text.trim()) return { ...d, shouldReply: false, reason: '未识别到新消息' };
   if (cfg.stopWords.some((w) => text.includes(w))) return { ...d, shouldReply: false, reason: '命中停止词，转人工' };
-  if (cfg.whitelist.length) {
-    const hit = cfg.whitelist.some((w) => w && (String(d.contact || '').includes(w) || text.includes(w)));
-    if (!hit) return { ...d, shouldReply: false, reason: '联系人/群不在白名单' };
+  if (!whitelistHit(cfg, d)) {
+    return { ...d, shouldReply: false, reason: `联系人/群不在白名单（会话=${d.contact || '?'}，发言人=${d.speaker || '?'}）` };
   }
   if (cfg.triggerPrefix) {
     const body = text.replace(/^@\S+\s*/, '').trim();
@@ -462,14 +494,12 @@ export async function draftReply(inst: Instance, userMessage?: string, opts?: { 
   let image: Buffer | null = null;
   try {
     if (!userMessage) {
-      // 全自动截图前先把微信窗口切到前台：xwd -root 截的是整个 X 桌面，若焦点/前台是别的程序，
-      // 模型会看到错误画面。主动聚焦保证裁剪出的聊天区确实是微信。
-      if (opts?.autoFocus) {
-        const cls = await focusChatWindow(inst, inst.appType);
-        if (!/wechat|weixin/.test(cls)) {
-          appendInstanceLog(inst.id, `[ai-reply] 自动截图前无法聚焦微信窗口（class=${cls || '空'}），本轮跳过`);
-          throw new Error('自动截图前无法把微信窗口切到前台，请确认微信已打开会话');
-        }
+      // 截图前先把微信窗口切到前台：xwd -root 截的是整个 X 桌面，若焦点/前台是别的程序，
+      // 模型会看到错误画面。人工点「生成草稿」时焦点常在面板浏览器，同样需要先聚焦，否则截到浏览器。
+      const cls = await focusChatWindow(inst, inst.appType);
+      if (!/wechat|weixin/.test(cls)) {
+        appendInstanceLog(inst.id, `[ai-reply] 截图前无法聚焦微信窗口（class=${cls || '空'}），本轮跳过`);
+        throw new Error('无法把微信窗口切到前台，请确认微信已打开会话，然后重试');
       }
       image = await captureChatPng(inst);
     }
@@ -481,13 +511,14 @@ export async function draftReply(inst: Instance, userMessage?: string, opts?: { 
       shouldReply: parsed.shouldReply === true || parsed.shouldReply === 'true',
       reason: String(parsed.reason || ''),
       contact: String(parsed.contact || ''),
+      speaker: String(parsed.speaker || ''),
       message: String(parsed.message || ''),
       reply: String(parsed.reply || ''),
       usedScreenshot: !!image,
       elapsedMs: Date.now() - started,
     };
     const result = applyRules(cfg, d);
-    appendInstanceLog(inst.id, `[ai-reply] 草稿 shouldReply=${result.shouldReply} 联系人=${result.contact || '-'} 原因=${result.reason || '-'} 耗时=${result.elapsedMs}ms`);
+    appendInstanceLog(inst.id, `[ai-reply] 草稿 shouldReply=${result.shouldReply} 会话=${result.contact || '-'} 发言人=${result.speaker || '-'} 原因=${result.reason || '-'} 耗时=${result.elapsedMs}ms`);
     return result;
   } catch (e: any) {
     const err = String(e?.message || e).slice(0, 300);
